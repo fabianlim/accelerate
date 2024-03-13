@@ -182,3 +182,10 @@ mixtral 8x7B      | 69G                 | OOM                 | 69G
 
 > [!WARNING] 
 > Disabling `no_sync` means there _will be slowdown_ due the extra data syncs, as explained by the earlier sections of this guide.
+
+Whenever the `no_sync` FSDP overhead is small, we recommend to set `sync_each_batch=False`. The below example considers fine-tuning Llama (13b) on 2 A100-80GB GPUs.
+The memory consumption for `gradient_accumulation_steps=16` using `no_sync` did not exceed the total available VRAM.
+
+| Model           | `no_sync` (accum=1) | `no_sync` (accum=16) | `no_sync` disabled (accum=16)
+| :-------------: | :-----------------: | :------------------: | :-----------------: 
+llama13b           | 70G                 | <80G                  | 70G 
