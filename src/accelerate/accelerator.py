@@ -404,6 +404,15 @@ class Accelerator:
                 parse_choice_from_env("ACCELERATE_GRADIENT_ACCUMULATION_STEPS", gradient_accumulation_steps)
             )
             gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=gradient_accumulation_steps)
+
+        if (
+            gradient_accumulation_plugin.num_steps > 1 and not gradient_accumulation_plugin.sync_each_batch
+            and fsdp_plugin.cpu_offload
+        ):
+            raise ValueError(
+                "sync_each_batch==False and gradient_accumulation_steps > 1 will result in incorrect gradients when used with FSDP.CPU_OFFLOAD"
+            )
+
         self.gradient_state = GradientState(
             gradient_accumulation_plugin=gradient_accumulation_plugin,
         )
