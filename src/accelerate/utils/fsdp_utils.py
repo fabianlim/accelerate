@@ -23,6 +23,7 @@ from .constants import FSDP_MODEL_NAME, OPTIMIZER_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from .modeling import is_peft_model
 from .other import save
 from .versions import is_torch_version
+from tqdm import tqdm
 
 
 logger = get_logger(__name__)
@@ -380,6 +381,9 @@ def prepare_fsdpv2(
     dp_mesh: DeviceMesh = None,
     reshard_after_forward: bool = True,
     offload_policy: str = None,
+    non_zero_ranks_on_meta: bool = False, # for low_cpu
+    device=None, # for low_cpu
+    group=None, # for low_cpu
 ):
     # fsdp v2 imports
     from torch.distributed import init_device_mesh
@@ -402,10 +406,59 @@ def prepare_fsdpv2(
         "mesh": dp_mesh, "mp_policy": mp_policy,
         "reshard_after_forward": reshard_after_forward
     }
+    # no_shard_modules = model._no_split_modules
+    # for module in model.modules():
+    #     classname = module.__class__.__name__
+    #     if classname in no_shard_modules:
+    #         fully_shard(module, **fsdp_config)
+
+    # fully_shard(model, **fsdp_config)
+
     no_shard_modules = model._no_split_modules
-    for module in model.modules():
+    if non_zero_ranks_on_meta:
+        state_dict_keys = set([name for name, _ in model.named_parameters()])
+        is_meta_rank = model.device == torch.device('meta')
+
+    i = 0
+    for name, module in model.named_modules():
         classname = module.__class__.__name__
         if classname in no_shard_modules:
-            fully_shard(module, **fsdp_config)
 
-    fully_shard(model, **fsdp_config)
+            if non_zero_ranks_on_meta:
+                # we broadcast the layer
+                if is_meta_rank:
+                    module.to_empty(device=device)
+
+                for _param_name, _param in module.named_parameters():
+                    torch.distributed.barrier()
+                    torch.distributed.broadcast(_param.to(device), src=0, group=group)
+                    fqdn = name + '.' + _param_name
+                    state_dict_keys.discard(fqdn)
+
+            fully_shard(module, **fsdp_config)
+            print ('layer', i, 'rank', torch.distributed.get_rank())
+            i += 1
+
+    # remaining params
+    if non_zero_ranks_on_meta:
+        for _param_name in state_dict_keys:
+            _param_name = _param_name.split('.')
+            if len(_param_name) == 1:
+                module = model
+            else:
+                module = model.get_submodule('.'.join(_param_name[:-1]))
+
+            _param = getattr(module, _param_name[-1])
+            if is_meta_rank:
+                # NOTE: might cause problems with tied weights
+                _param = torch.nn.Parameter(
+                    torch.empty_like(_param.data, device=device),
+                    requires_grad=_param.requires_grad   
+                )
+            
+            torch.distributed.barrier()
+            torch.distributed.broadcast(_param.to(device), src=0, group=group)
+            if is_meta_rank:
+                setattr(module, _param_name[-1], _param)
+    fully_shard(model, **fsdp_config) 
+    print ('after last', torch.distributed.get_rank())

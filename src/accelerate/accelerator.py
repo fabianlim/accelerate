@@ -1606,13 +1606,15 @@ class Accelerator:
                         ),
                         reshard_after_forward=True,
                         offload_policy="cpu" if fsdp_plugin.cpu_offload.offload_params else None,
-                        dp_mesh=dp_mesh
+                        dp_mesh=dp_mesh,
+                        non_zero_ranks_on_meta=fsdp_plugin.sync_module_states,
+                        device=self.device,
                     )
                     # there is not setting for fsdp_plugin.use_orig_params:
 
-                    if model.device == torch.device('meta'):
-                        # need to realize the empty modules after sharding
-                        model.to_empty(device=self.device)
+                    # if model.device == torch.device('meta'):
+                    #     # need to realize the empty modules after sharding
+                    #     model.to_empty(device=self.device)
 
                     if fsdp_plugin.activation_checkpointing:
                         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
