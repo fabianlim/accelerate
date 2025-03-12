@@ -1548,6 +1548,8 @@ class Accelerator:
                 # In case the model is already compiled using PyTorch 2.0 and the wrapped model in it
                 # is a FSDP model, don't wrap it again
                 is_type_fsdp = isinstance(model, FSDP) or (
+                    model.__class__.__name__.startswith("FSDP")
+                ) or (
                     is_compiled_module(model) and isinstance(model._orig_mod, FSDP)
                 )
 
@@ -1577,7 +1579,40 @@ class Accelerator:
                         "limit_all_gathers": fsdp_plugin.limit_all_gathers,
                         "device_id": self.device,
                     }
-                    model = FSDP(model, **kwargs)
+                    # FSDPv1
+                    # model = FSDP(model, **kwargs)
+                    from .utils.fsdp_utils import prepare_fsdpv2
+
+                    # need to handle translation more carefully
+                    # - sharding strategy is handled by passing dp_mesh
+                    from torch.distributed.fsdp import ShardingStrategy
+                    if fsdp_plugin.sharding_strategy == ShardingStrategy.FULL_SHARD:
+                        dp_mesh = None
+                    else:
+                        raise NotImplementedError("Currently only support full shard for FSDPv2")
+
+                    # FSDPv2
+                    prepare_fsdpv2(
+                        model,
+                        param_dtype=(
+                            fsdp_plugin.mixed_precision_policy.param_dtype if
+                            fsdp_plugin.mixed_precision_policy is not None else 
+                            model.dtype
+                        ),
+                        reduce_dtype=(
+                            fsdp_plugin.mixed_precision_policy.reduce_dtype if 
+                            fsdp_plugin.mixed_precision_policy is not None else 
+                            model.dtype
+                        ),
+                        reshard_after_forward=not fsdp_plugin.use_orig_params,
+                        offload_policy="cpu" if fsdp_plugin.cpu_offload.offload_params else None,
+                        dp_mesh=dp_mesh
+                    )
+
+                    if model.device == torch.device('meta'):
+                        # need to realize the empty modules after sharding
+                        model.to_empty(device=self.device)
+
                     if fsdp_plugin.activation_checkpointing:
                         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
                             CheckpointImpl,
@@ -2457,7 +2492,17 @@ class Accelerator:
             parameters = [p for p in parameters]
             for model in self._models:
                 if parameters == [p for p in model.parameters()]:
-                    return model.clip_grad_norm_(max_norm, norm_type)
+                    # FSDPv1
+                    # return model.clip_grad_norm_(max_norm, norm_type)
+                    # FSDPv2 (torchtitan.distributed.utils)
+                    # total_norm = torch.nn.utils.get_total_norm(
+                    #     [p.grad for p in parameters if p.grad is not None],
+                    #     norm_type, # error_if_nonfinite, foreach
+                    # )
+                    # total_norm = total_norm.full_tensor()
+                    # torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm) # foreach)
+                    return torch.nn.utils.clip_grad_norm_(parameters, max_norm) # foreach)
+
         elif self.distributed_type == DistributedType.DEEPSPEED:
             # `accelerator.backward(loss)` is doing that automatically. Therefore, its implementation is not needed
             # We cannot return the gradient norm because DeepSpeed does it.

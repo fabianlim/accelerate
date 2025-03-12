@@ -371,3 +371,41 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.c
         return module
 
     return param_init_fn_tied_param
+
+from torch.distributed import DeviceMesh
+def prepare_fsdpv2(
+    model: torch.nn.Module, 
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    dp_mesh: DeviceMesh = None,
+    reshard_after_forward: bool = True,
+    offload_policy: str = None,
+):
+    # fsdp v2 imports
+    from torch.distributed import init_device_mesh
+    from torch.distributed._composable.fsdp import (
+        fully_shard, MixedPrecisionPolicy, OffloadPolicy
+    )
+
+    # if dp_mesh is None:
+    #     world_size = torch.distributed.get_world_size()
+    #     device_type = 'cuda'
+    #     device_mesh = init_device_mesh(
+    #         device_type, (world_size,), mesh_dim_names=('dp',)
+    #     )
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype, reduce_dtype=reduce_dtype
+    )
+
+    fsdp_config = {
+        "mesh": dp_mesh, "mp_policy": mp_policy,
+        "reshard_after_forward": reshard_after_forward
+    }
+    no_shard_modules = model._no_split_modules
+    for module in model.modules():
+        classname = module.__class__.__name__
+        if classname in no_shard_modules:
+            fully_shard(module, **fsdp_config)
+
+    fully_shard(model, **fsdp_config)
