@@ -1604,10 +1604,11 @@ class Accelerator:
                             fsdp_plugin.mixed_precision_policy is not None else 
                             model.dtype
                         ),
-                        reshard_after_forward=not fsdp_plugin.use_orig_params,
+                        reshard_after_forward=True,
                         offload_policy="cpu" if fsdp_plugin.cpu_offload.offload_params else None,
                         dp_mesh=dp_mesh
                     )
+                    # there is not setting for fsdp_plugin.use_orig_params:
 
                     if model.device == torch.device('meta'):
                         # need to realize the empty modules after sharding
@@ -1628,6 +1629,8 @@ class Accelerator:
                             ),
                             auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
                         )
+
+                # FIXME: this upcasting not working for FSDPv2
 
                 # In the event the model had been loaded in low precision, but
                 # mixed precision had also been activated, then we follow DeepSpeed's
