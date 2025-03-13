@@ -411,18 +411,26 @@ def prepare_fsdpv2(
         "reshard_after_forward": reshard_after_forward
     }
 
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed._tensor import distribute_tensor, DTensor
     no_shard_modules = model._no_split_modules
     if non_zero_ranks_on_meta:
         state_dict_keys = set([name for name, _ in model.named_parameters()])
         is_meta_rank = model.device == torch.device('meta')
 
-    for name, module in model.named_modules():
+    for name, module in reversed(list(model.named_modules())):
         classname = module.__class__.__name__
-        if classname in no_shard_modules:
+        if (
+            classname in no_shard_modules or
+            (classname in ("Linear", "Embedding") and max(module.weight.shape) > 1e5)
+        ):
 
             if non_zero_ranks_on_meta and not is_meta_rank:
                 # save the full dict first
-                full_sd = module.state_dict()
+                full_sd = {
+                    k:v for k, v in module.state_dict().items()
+                    if (name + '.' + k) in state_dict_keys
+                }
 
             # apply fully shard
             fully_shard(module, **fsdp_config)
@@ -431,7 +439,14 @@ def prepare_fsdpv2(
 
                 # for the meta ranks, need to distribute the weights
                 sharded_sd = {}
-                for _param_name, sharded_param in module.named_parameters():
+                for _param_name in full_sd:
+
+                    # for keys
+                    _names = _param_name.split('.')
+                    sharded_param = getattr(
+                        module.get_submodule('.'.join(_names[:-1])), 
+                        _names[-1]
+                    )
 
                     if not is_meta_rank:
                         full_tensor = full_sd[_param_name]
@@ -453,7 +468,7 @@ def prepare_fsdpv2(
                     fqdn = name + '.' + _param_name
                     state_dict_keys.discard(fqdn)
 
-                module.load_state_dict(sharded_sd, assign=True)
+                module.load_state_dict(sharded_sd, strict=False, assign=True)
 
     # handle the top level 
     if non_zero_ranks_on_meta and not is_meta_rank:
@@ -484,6 +499,7 @@ def prepare_fsdpv2(
             if not is_meta_rank:
                 full_tensor = full_sd[_param_name]
             else:
+                # full_tensor = sharded_param.full_tensor()
                 full_tensor = torch.empty(
                     sharded_param.shape,
                     dtype=sharded_param.dtype,
@@ -498,3 +514,5 @@ def prepare_fsdpv2(
 
         # need strict=False as the inner module keys are already assigned
         model.load_state_dict(sharded_sd, strict=False, assign=True)
+
+    torch.distributed.breakpoint(1)
