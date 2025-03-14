@@ -23,6 +23,7 @@ from .constants import FSDP_MODEL_NAME, OPTIMIZER_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from .modeling import is_peft_model
 from .other import save
 from .versions import is_torch_version
+from tqdm import tqdm
 
 
 logger = get_logger(__name__)
@@ -371,3 +372,93 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.c
         return module
 
     return param_init_fn_tied_param
+
+# inspired by 
+# https://github.com/pytorch/torchtune/blob/main/torchtune/training/_distributed.py
+from torch.distributed import DeviceMesh
+def prepare_fsdpv2(
+    model: torch.nn.Module, 
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    dp_mesh: DeviceMesh = None,
+    reshard_after_forward: bool = True,
+    offload_policy: str = None,
+    non_zero_ranks_on_meta: bool = False, # for low_cpu
+    device=None, # for low_cpu
+    group=None, # for low_cpu
+):
+    # fsdp v2 imports
+    from torch.distributed import init_device_mesh
+    from torch.distributed._composable.fsdp import (
+        fully_shard, MixedPrecisionPolicy, OffloadPolicy
+    )
+    from torch.distributed._tensor import distribute_tensor, DTensor
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype, reduce_dtype=reduce_dtype
+    )
+
+    # set the fsdp configs
+    fsdp_config = {
+        "mesh": dp_mesh, "mp_policy": mp_policy,
+        "reshard_after_forward": reshard_after_forward
+    }
+
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed._tensor import distribute_tensor, DTensor
+    no_shard_modules = model._no_split_modules
+    if non_zero_ranks_on_meta:
+        is_meta_rank = model.device == torch.device('meta')
+
+        # keep reference to the keys
+        state_dict_keys = sorted([name for name, _ in model.named_parameters()])
+        if not is_meta_rank:
+            # keep a copy before sharding
+            full_sd = model.state_dict()
+
+    # sharding
+    for module in reversed(list(model.modules())):
+        classname = module.__class__.__name__
+        if (
+            classname in no_shard_modules or
+            (classname in ("Linear", "Embedding") and max(module.weight.shape) > 1e5)
+        ):
+            fully_shard(module, **fsdp_config)
+
+    # shard top level
+    fully_shard(model, **fsdp_config) 
+
+    if non_zero_ranks_on_meta:
+
+        # need to distribute weights
+        sharded_sd = {}
+        for _param_name in tqdm(
+            state_dict_keys, disable=is_meta_rank,
+            desc='Syncing Weights'
+        ):
+
+            # for keys
+            _names = _param_name.split('.')
+            sharded_param = getattr(
+                model.get_submodule('.'.join(_names[:-1])), 
+                _names[-1]
+            )
+
+            if not is_meta_rank:
+                full_tensor = full_sd[_param_name].to(sharded_param.dtype).to(device)
+            else:
+                full_tensor = torch.empty(
+                    sharded_param.shape,
+                    dtype=sharded_param.dtype,
+                    device=device
+                )
+
+            sharded_tensor = distribute_tensor(
+                full_tensor,
+                sharded_param.device_mesh,
+                sharded_param.placements,
+            )
+            sharded_sd[_param_name] = sharded_tensor
+
+        model.load_state_dict(sharded_sd, assign=True)
+        del sharded_sd
