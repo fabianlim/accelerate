@@ -23,6 +23,7 @@ from .constants import FSDP_MODEL_NAME, OPTIMIZER_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from .modeling import is_peft_model
 from .other import save
 from .versions import is_torch_version
+from tqdm import tqdm
 
 
 logger = get_logger(__name__)
@@ -63,7 +64,7 @@ def _set_model_state_dict(model, state_dict, adapter_only=False):
         return model.load_state_dict(state_dict)
 
 
-def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
+def save_fsdp1_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
@@ -113,7 +114,7 @@ def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, 
             logger.info(f"Model saved to {ckpt_dir}")
 
 
-def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, adapter_only=False):
+def load_fsdp1_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
@@ -172,7 +173,7 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
     return load_result
 
 
-def save_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, optimizer_index=0):
+def save_fsdp1_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, optimizer_index=0):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
@@ -205,7 +206,7 @@ def save_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, 
             logger.info(f"Optimizer state saved in {ckpt_dir}")
 
 
-def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, optimizer_index=0, adapter_only=False):
+def load_fsdp1_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, optimizer_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
@@ -243,6 +244,19 @@ def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, o
         flattened_osd = FSDP.optim_state_dict_to_load(model=model, optim=optimizer, optim_state_dict=optim_state)
         optimizer.load_state_dict(flattened_osd)
 
+# SET THESE FOR FSDP1
+# save_fsdp_optimizer = save_fsdp1_optimizer
+# load_fsdp_optimizer = load_fsdp1_optimizer
+# save_fsdp_model = save_fsdp1_model
+# load_fsdp_model = load_fsdp1_model
+
+# THESE FOR FSDP2
+from .fsdp2_utils import (
+    save_fsdp_model,
+    load_fsdp_model,
+    save_fsdp_optimizer,
+    load_fsdp_optimizer
+)
 
 def _distributed_checkpoint_to_merged_weights(checkpoint_dir: str, save_path: str, safe_serialization: bool = True):
     """
@@ -371,3 +385,93 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.c
         return module
 
     return param_init_fn_tied_param
+
+# inspired by 
+# https://github.com/pytorch/torchtune/blob/main/torchtune/training/_distributed.py
+from torch.distributed import DeviceMesh
+def prepare_fsdpv2(
+    model: torch.nn.Module, 
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    dp_mesh: DeviceMesh = None,
+    reshard_after_forward: bool = True,
+    offload_policy: str = None,
+    non_zero_ranks_on_meta: bool = False, # for low_cpu
+    device=None, # for low_cpu
+    group=None, # for low_cpu
+):
+    # fsdp v2 imports
+    from torch.distributed import init_device_mesh
+    from torch.distributed._composable.fsdp import (
+        fully_shard, MixedPrecisionPolicy, OffloadPolicy
+    )
+    from torch.distributed._tensor import distribute_tensor, DTensor
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype, reduce_dtype=reduce_dtype
+    )
+
+    # set the fsdp configs
+    fsdp_config = {
+        "mesh": dp_mesh, "mp_policy": mp_policy,
+        "reshard_after_forward": reshard_after_forward
+    }
+
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed._tensor import distribute_tensor, DTensor
+    no_shard_modules = model._no_split_modules
+    if non_zero_ranks_on_meta:
+        is_meta_rank = model.device == torch.device('meta')
+
+        # keep reference to the keys
+        state_dict_keys = sorted([name for name, _ in model.named_parameters()])
+        if not is_meta_rank:
+            # keep a copy before sharding
+            full_sd = model.state_dict()
+
+    # sharding
+    for module in reversed(list(model.modules())):
+        classname = module.__class__.__name__
+        if (
+            classname in no_shard_modules or
+            (classname in ("Linear", "Embedding") and max(module.weight.shape) > 1e5)
+        ):
+            fully_shard(module, **fsdp_config)
+
+    # shard top level
+    fully_shard(model, **fsdp_config) 
+
+    if non_zero_ranks_on_meta:
+
+        # need to distribute weights
+        sharded_sd = {}
+        for _param_name in tqdm(
+            state_dict_keys, disable=is_meta_rank,
+            desc='Syncing Weights'
+        ):
+
+            # for keys
+            _names = _param_name.split('.')
+            sharded_param = getattr(
+                model.get_submodule('.'.join(_names[:-1])), 
+                _names[-1]
+            )
+
+            if not is_meta_rank:
+                full_tensor = full_sd[_param_name].to(sharded_param.dtype).to(device)
+            else:
+                full_tensor = torch.empty(
+                    sharded_param.shape,
+                    dtype=sharded_param.dtype,
+                    device=device
+                )
+
+            sharded_tensor = distribute_tensor(
+                full_tensor,
+                sharded_param.device_mesh,
+                sharded_param.placements,
+            )
+            sharded_sd[_param_name] = sharded_tensor
+
+        model.load_state_dict(sharded_sd, assign=True)
+        del sharded_sd
