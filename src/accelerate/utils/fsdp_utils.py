@@ -64,7 +64,7 @@ def _set_model_state_dict(model, state_dict, adapter_only=False):
         return model.load_state_dict(state_dict)
 
 
-def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
+def save_fsdp1_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
@@ -114,7 +114,7 @@ def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, 
             logger.info(f"Model saved to {ckpt_dir}")
 
 
-def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, adapter_only=False):
+def load_fsdp1_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
@@ -173,7 +173,7 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
     return load_result
 
 
-def save_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, optimizer_index=0):
+def save_fsdp1_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, optimizer_index=0):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
@@ -206,7 +206,7 @@ def save_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, 
             logger.info(f"Optimizer state saved in {ckpt_dir}")
 
 
-def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, optimizer_index=0, adapter_only=False):
+def load_fsdp1_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, optimizer_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
@@ -244,6 +244,19 @@ def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, o
         flattened_osd = FSDP.optim_state_dict_to_load(model=model, optim=optimizer, optim_state_dict=optim_state)
         optimizer.load_state_dict(flattened_osd)
 
+# SET THESE FOR FSDP1
+# save_fsdp_optimizer = save_fsdp1_optimizer
+# load_fsdp_optimizer = load_fsdp1_optimizer
+# save_fsdp_model = save_fsdp1_model
+# load_fsdp_model = load_fsdp1_model
+
+# THESE FOR FSDP2
+from .fsdp2_utils import (
+    save_fsdp_model,
+    load_fsdp_model,
+    save_fsdp_optimizer,
+    load_fsdp_optimizer
+)
 
 def _distributed_checkpoint_to_merged_weights(checkpoint_dir: str, save_path: str, safe_serialization: bool = True):
     """
